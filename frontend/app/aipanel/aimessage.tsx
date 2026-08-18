@@ -1,0 +1,362 @@
+// Copyright 2025, Command Line Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+import { WaveStreamdown } from "@/app/element/streamdown";
+import { atoms, globalStore } from "@/app/store/global";
+import { RpcApi } from "@/app/store/wshclientapi";
+import { TabRpcClient } from "@/app/store/wshrpcutil";
+import * as WOS from "@/app/store/wos";
+import { cn, stringToBase64 } from "@/util/util";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { getFileIcon } from "./ai-utils";
+import { AIFeedbackButtons } from "./aifeedbackbuttons";
+import { AIToolUseGroup } from "./aitooluse";
+import { WaveUIMessage, WaveUIMessagePart } from "./aitypes";
+import { WaveAIModel } from "./waveai-model";
+
+const AIThinking = memo(
+    ({
+        message = "AI is thinking...",
+        reasoningText,
+        isWaitingApproval = false,
+    }: {
+        message?: string;
+        reasoningText?: string;
+        isWaitingApproval?: boolean;
+    }) => {
+        const scrollRef = useRef<HTMLDivElement>(null);
+        const [elapsed, setElapsed] = useState(0);
+
+        useEffect(() => {
+            const startTime = Date.now();
+            const timer = setInterval(() => {
+                setElapsed(Math.floor((Date.now() - startTime) / 1000));
+            }, 1000);
+            return () => clearInterval(timer);
+        }, [message]);
+
+        useEffect(() => {
+            if (scrollRef.current && reasoningText) {
+                scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+            }
+        }, [reasoningText]);
+
+        const displayText = reasoningText
+            ? (() => {
+                  const lastDoubleNewline = reasoningText.lastIndexOf("\n\n");
+                  return lastDoubleNewline !== -1 ? reasoningText.substring(lastDoubleNewline + 2) : reasoningText;
+              })()
+            : "";
+
+        const timeStr = elapsed > 0 ? ` (${elapsed}s)` : "";
+
+        return (
+            <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                    {isWaitingApproval ? (
+                        <i className="fa fa-clock text-base text-yellow-500"></i>
+                    ) : (
+                        <div className="animate-pulse flex items-center">
+                            <i className="fa fa-circle text-[10px]"></i>
+                            <i className="fa fa-circle text-[10px] mx-1"></i>
+                            <i className="fa fa-circle text-[10px]"></i>
+                        </div>
+                    )}
+                    {message && <span className="text-sm text-gray-400">{message}{timeStr}</span>}
+                </div>
+                <div ref={scrollRef} className="text-sm text-gray-500 overflow-y-auto h-[3lh] max-w-[600px] pl-9">
+                    {displayText}
+                </div>
+            </div>
+        );
+    }
+);
+
+AIThinking.displayName = "AIThinking";
+
+interface UserMessageFilesProps {
+    fileParts: Array<WaveUIMessagePart & { type: "data-userfile" }>;
+}
+
+const UserMessageFiles = memo(({ fileParts }: UserMessageFilesProps) => {
+    if (fileParts.length === 0) return null;
+
+    return (
+        <div className="mt-2 pt-2 border-t border-gray-600">
+            <div className="flex gap-2 overflow-x-auto pb-1">
+                {fileParts.map((file, index) => (
+                    <div key={index} className="relative bg-zinc-700 rounded-lg p-2 min-w-20 flex-shrink-0">
+                        <div className="flex flex-col items-center text-center">
+                            <div className="w-12 h-12 mb-1 flex items-center justify-center bg-zinc-600 rounded overflow-hidden">
+                                {file.data?.previewurl ? (
+                                    <img
+                                        src={file.data.previewurl}
+                                        alt={file.data?.filename || "File"}
+                                        className="w-full h-full object-cover"
+                                    />
+                                ) : (
+                                    <i
+                                        className={cn(
+                                            "fa text-lg text-gray-300",
+                                            getFileIcon(file.data?.filename || "", file.data?.mimetype || "")
+                                        )}
+                                    ></i>
+                                )}
+                            </div>
+                            <div
+                                className="text-[10px] text-gray-200 truncate w-full max-w-16"
+                                title={file.data?.filename || "File"}
+                            >
+                                {file.data?.filename || "File"}
+                            </div>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+});
+
+UserMessageFiles.displayName = "UserMessageFiles";
+
+interface AIMessagePartProps {
+    part: WaveUIMessagePart;
+    role: string;
+    isStreaming: boolean;
+}
+
+function findFirstTerminalBlockId(): string | null {
+    const tabId = globalStore.get(atoms.staticTabId);
+    const tabObj = WOS.getObjectValue<Tab>(WOS.makeORef("tab", tabId));
+    if (!tabObj?.blockids) return null;
+    for (const blockId of tabObj.blockids) {
+        const block = WOS.getObjectValue<Block>(WOS.makeORef("block", blockId));
+        if (block?.meta?.view === "term") {
+            return blockId;
+        }
+    }
+    return null;
+}
+
+function sendCommandToTerminal(cmd: string) {
+    const blockId = findFirstTerminalBlockId();
+    if (!blockId) return;
+    const b64data = stringToBase64(cmd + "\n");
+    RpcApi.ControllerInputCommand(TabRpcClient, { blockid: blockId, inputdata64: b64data });
+}
+
+const AIMessagePart = memo(({ part, role, isStreaming }: AIMessagePartProps) => {
+    const model = WaveAIModel.getInstance();
+
+    const handleExecute = useCallback((cmd: string) => {
+        sendCommandToTerminal(cmd);
+    }, []);
+
+    if (part.type === "text") {
+        const content = part.text ?? "";
+
+        if (role === "user") {
+            return <div className="whitespace-pre-wrap break-words">{content}</div>;
+        } else {
+            return (
+                <WaveStreamdown
+                    text={content}
+                    parseIncompleteMarkdown={isStreaming}
+                    className="text-gray-100"
+                    codeBlockMaxWidthAtom={model.codeBlockMaxWidth}
+                    onClickExecute={handleExecute}
+                />
+            );
+        }
+    }
+
+    if (part.type === "data-usage") {
+        const data = (part as any).data;
+        if (data) {
+            const input = data.input_tokens ?? 0;
+            const output = data.output_tokens ?? 0;
+            const total = data.total_tokens ?? input + output;
+            return (
+                <div className="text-xs text-gray-500 mt-1 select-none">
+                    tokens: {total.toLocaleString()} (in: {input.toLocaleString()}, out: {output.toLocaleString()})
+                </div>
+            );
+        }
+    }
+
+    if (part.type === "data-compact") {
+        const data = (part as any).data;
+        if (data) {
+            const count = data.compacted_messages ?? 0;
+            const sizeBefore = data.total_size_before ?? 0;
+            return (
+                <div className="text-xs text-yellow-600 mt-1 select-none flex items-center gap-1">
+                    <i className="fa fa-compress text-[10px]"></i>
+                    context compacted: {count} old tool results cleared ({Math.round(sizeBefore / 1024)}KB → lean)
+                </div>
+            );
+        }
+    }
+
+    return null;
+});
+
+AIMessagePart.displayName = "AIMessagePart";
+
+interface AIMessageProps {
+    message: WaveUIMessage;
+    isStreaming: boolean;
+}
+
+const isDisplayPart = (part: WaveUIMessagePart): boolean => {
+    return (
+        part.type === "text" ||
+        part.type === "data-tooluse" ||
+        part.type === "data-toolprogress" ||
+        part.type === "data-usage" ||
+        part.type === "data-compact" ||
+        (part.type.startsWith("tool-") && "state" in part && part.state === "input-available")
+    );
+};
+
+type MessagePart =
+    | { type: "single"; part: WaveUIMessagePart }
+    | { type: "toolgroup"; parts: Array<WaveUIMessagePart & { type: "data-tooluse" | "data-toolprogress" }> };
+
+const groupMessageParts = (parts: WaveUIMessagePart[]): MessagePart[] => {
+    const grouped: MessagePart[] = [];
+    let currentToolGroup: Array<WaveUIMessagePart & { type: "data-tooluse" | "data-toolprogress" }> = [];
+
+    for (const part of parts) {
+        if (part.type === "data-tooluse" || part.type === "data-toolprogress") {
+            currentToolGroup.push(part as WaveUIMessagePart & { type: "data-tooluse" | "data-toolprogress" });
+        } else {
+            if (currentToolGroup.length > 0) {
+                grouped.push({ type: "toolgroup", parts: currentToolGroup });
+                currentToolGroup = [];
+            }
+            grouped.push({ type: "single", part });
+        }
+    }
+
+    if (currentToolGroup.length > 0) {
+        grouped.push({ type: "toolgroup", parts: currentToolGroup });
+    }
+
+    return grouped;
+};
+
+const getThinkingMessage = (
+    parts: WaveUIMessagePart[],
+    isStreaming: boolean,
+    role: string
+): { message: string; reasoningText?: string; isWaitingApproval?: boolean } | null => {
+    if (!isStreaming || role !== "assistant") {
+        return null;
+    }
+
+    const hasPendingApprovals = parts.some(
+        (part) => part.type === "data-tooluse" && part.data?.approval === "needs-approval"
+    );
+
+    if (hasPendingApprovals) {
+        return { message: "Waiting for Tool Approvals...", isWaitingApproval: true };
+    }
+
+    const lastPart = parts[parts.length - 1];
+
+    if (lastPart?.type === "reasoning") {
+        const reasoningContent = lastPart.text || "";
+        return { message: "AI is thinking...", reasoningText: reasoningContent };
+    }
+
+    if (lastPart?.type === "text" && lastPart.text) {
+        return null;
+    }
+
+    // During tool execution, show which tool is running
+    const toolParts = parts.filter((p) => p.type === "data-tooluse");
+    if (toolParts.length > 0) {
+        const pendingParts = toolParts.filter((p) => p.data?.status === "pending");
+        const completedParts = toolParts.filter((p) => p.data?.status === "completed");
+
+        if (pendingParts.length > 0) {
+            // Tools are still executing
+            const lastPending = pendingParts[pendingParts.length - 1];
+            const toolDesc = lastPending.data?.tooldesc;
+            const toolName = lastPending.data?.toolname || "tool";
+            const displayDesc = toolDesc || toolName.replace(/_/g, " ");
+            return { message: `Running: ${displayDesc}` };
+        }
+
+        if (completedParts.length > 0) {
+            // All tools completed, model is processing results
+            return {
+                message: `Processing results (${completedParts.length} tool${completedParts.length > 1 ? "s" : ""} completed)...`,
+            };
+        }
+    }
+
+    return { message: "AI is thinking..." };
+};
+
+export const AIMessage = memo(({ message, isStreaming }: AIMessageProps) => {
+    const parts = message.parts || [];
+    const displayParts = parts.filter(isDisplayPart);
+    const fileParts = parts.filter(
+        (part): part is WaveUIMessagePart & { type: "data-userfile" } => part.type === "data-userfile"
+    );
+
+    const thinkingData = getThinkingMessage(parts, isStreaming, message.role);
+    const groupedParts = groupMessageParts(displayParts);
+
+    return (
+        <div className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}>
+            <div
+                className={cn(
+                    "px-2 rounded-lg [&>*:first-child]:!mt-0",
+                    message.role === "user"
+                        ? "py-2 bg-zinc-700/60 text-white max-w-[calc(100%-50px)]"
+                        : "min-w-[min(100%,500px)]"
+                )}
+            >
+                {displayParts.length === 0 && !isStreaming && !thinkingData ? (
+                    <div className="whitespace-pre-wrap break-words">(no text content)</div>
+                ) : (
+                    <>
+                        {groupedParts.map((group, index: number) =>
+                            group.type === "toolgroup" ? (
+                                <AIToolUseGroup key={index} parts={group.parts} isStreaming={isStreaming} />
+                            ) : (
+                                <div key={index} className="mt-2">
+                                    <AIMessagePart part={group.part} role={message.role} isStreaming={isStreaming} />
+                                </div>
+                            )
+                        )}
+                        {thinkingData != null && (
+                            <div className="mt-2">
+                                <AIThinking
+                                    message={thinkingData.message}
+                                    reasoningText={thinkingData.reasoningText}
+                                    isWaitingApproval={thinkingData.isWaitingApproval}
+                                />
+                            </div>
+                        )}
+                    </>
+                )}
+
+                {message.role === "user" && <UserMessageFiles fileParts={fileParts} />}
+                {message.role === "assistant" && !isStreaming && displayParts.length > 0 && (
+                    <AIFeedbackButtons
+                        messageText={parts
+                            .filter((p) => p.type === "text")
+                            .map((p) => p.text || "")
+                            .join("\n\n")}
+                    />
+                )}
+            </div>
+        </div>
+    );
+});
+
+AIMessage.displayName = "AIMessage";

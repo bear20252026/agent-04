@@ -1,0 +1,65 @@
+{
+    "defwidget@terminal": {
+        "display:order": -5,
+        "icon": "square-terminal",
+        "label": "terminal",
+        "blockdef": {
+            "meta": {
+                "view": "term",
+                "controller": "shell"
+            }
+        }
+    },
+    "defwidget@files": {
+        "display:order": -4,
+        "icon": "folder",
+        "label": "files",
+        "blockdef": {
+            "meta": {
+                "view": "preview",
+                "file": "~"
+            }
+        }
+    },
+    "defwidget@web": {
+        "display:order": -3,
+        "icon": "globe",
+        "label": "web",
+        "blockdef": {
+            "meta": {
+                "view": "web"
+            }
+        }
+    },
+    "defwidget@ai": {
+        "display:order": -2,
+        "icon": "sparkles",
+        "label": "ai",
+        "blockdef": {
+            "meta": {
+                "view": "waveai"
+            }
+        }
+    },
+    "defwidget@sysinfo": {
+        "display:order": -1,
+        "icon": "chart-line",
+        "label": "sysinfo",
+        "blockdef": {
+            "meta": {
+                "view": "sysinfo"
+            }
+        }
+    },
+    "defwidget@mcpclient": {
+        "display:order": 0,
+        "icon": "plug",
+        "label": "mcp client",
+        "description": "MCP Client - connect to Model Context Protocol servers",
+        "blockdef": {
+            "meta": {
+                "view": "mcpclient"
+            }
+        }
+    }
+}

@@ -1,0 +1,567 @@
+// Copyright 2025, Command Line Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+import { BlockModel } from "@/app/block/block-model";
+import { Modal } from "@/app/modals/modal";
+import { recordTEvent } from "@/app/store/global";
+import { cn, fireAndForget } from "@/util/util";
+import { useAtomValue } from "jotai";
+import { memo, useEffect, useRef, useState } from "react";
+import { WaveUIMessagePart } from "./aitypes";
+import { RestoreBackupModal } from "./restorebackupmodal";
+import { WaveAIModel } from "./waveai-model";
+
+// matches pkg/filebackup/filebackup.go
+const BackupRetentionDays = 5;
+
+interface ToolDescLineProps {
+    text: string;
+}
+
+const ToolDescLine = memo(({ text }: ToolDescLineProps) => {
+    let displayText = text;
+    if (displayText.startsWith("* ")) {
+        displayText = "• " + displayText.slice(2);
+    }
+
+    const parts: React.ReactNode[] = [];
+    let lastIndex = 0;
+    const regex = /(?<!\w)([+-])(\d+)(?!\w)/g;
+    let match;
+
+    while ((match = regex.exec(displayText)) !== null) {
+        if (match.index > lastIndex) {
+            parts.push(displayText.slice(lastIndex, match.index));
+        }
+
+        const sign = match[1];
+        const number = match[2];
+        const colorClass = sign === "+" ? "text-green-600" : "text-red-600";
+        parts.push(
+            <span key={match.index} className={colorClass}>
+                {sign}
+                {number}
+            </span>
+        );
+
+        lastIndex = match.index + match[0].length;
+    }
+
+    if (lastIndex < displayText.length) {
+        parts.push(displayText.slice(lastIndex));
+    }
+
+    return <div>{parts.length > 0 ? parts : displayText}</div>;
+});
+
+ToolDescLine.displayName = "ToolDescLine";
+
+interface ToolDescProps {
+    text: string | string[];
+    className?: string;
+}
+
+const ToolDesc = memo(({ text, className }: ToolDescProps) => {
+    const lines = Array.isArray(text) ? text : text.split("\n");
+
+    if (lines.length === 0) return null;
+
+    return (
+        <div className={className}>
+            {lines.map((line, idx) => (
+                <ToolDescLine key={idx} text={line} />
+            ))}
+        </div>
+    );
+});
+
+ToolDesc.displayName = "ToolDesc";
+
+// Extract directory path from a tool description like: reading "/path/to/file" (...)
+function extractDirFromToolDesc(toolDesc: string): string | null {
+    const match = toolDesc?.match(/(?:reading|reading directory)\s+"([^"]+)"/);
+    if (!match) return null;
+    const filePath = match[1];
+    // For "reading directory" — the path itself is the directory
+    if (toolDesc.startsWith("reading directory")) {
+        return filePath;
+    }
+    // For "reading" (file) — get parent directory (handle both / and \ separators)
+    const lastSlash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
+    if (lastSlash < 0) return filePath;
+    if (lastSlash === 0) return filePath.substring(0, 1);
+    return filePath.substring(0, lastSlash);
+}
+
+// Extract all unique directories from a set of tool use parts
+function extractDirsFromParts(parts: Array<WaveUIMessagePart & { type: "data-tooluse" }>): string[] {
+    const dirs = new Set<string>();
+    for (const part of parts) {
+        const dir = extractDirFromToolDesc(part.data.tooldesc);
+        if (dir) dirs.add(dir);
+    }
+    return Array.from(dirs);
+}
+
+function getEffectiveApprovalStatus(baseApproval: string, isStreaming: boolean): string {
+    return !isStreaming && baseApproval === "needs-approval" ? "timeout" : baseApproval;
+}
+
+interface AIToolApprovalButtonsProps {
+    count: number;
+    onApprove: () => void;
+    onDeny: () => void;
+    onAllowSession?: () => void;
+    showSessionButton?: boolean;
+    sessionButtonLabel?: string;
+    sessionButtonTitle?: string;
+}
+
+const AIToolApprovalButtons = memo(({ count, onApprove, onDeny, onAllowSession, showSessionButton, sessionButtonLabel, sessionButtonTitle }: AIToolApprovalButtonsProps) => {
+    const approveText = count > 1 ? `Approve All (${count})` : "Approve";
+    const denyText = count > 1 ? "Deny All" : "Deny";
+
+    return (
+        <div className="mt-2 flex gap-2">
+            <button
+                onClick={onApprove}
+                className="px-3 py-1 border border-gray-600 text-gray-300 hover:border-gray-500 hover:text-white text-sm rounded cursor-pointer transition-colors"
+            >
+                {approveText}
+            </button>
+            {showSessionButton && onAllowSession && (
+                <button
+                    onClick={onAllowSession}
+                    className="px-3 py-1 border border-green-700 text-green-400 hover:border-green-500 hover:text-green-300 text-sm rounded cursor-pointer transition-colors"
+                    title={sessionButtonTitle || "Auto-approve all file operations under this directory for the rest of this session"}
+                >
+                    {sessionButtonLabel || "Allow in this session"}
+                </button>
+            )}
+            <button
+                onClick={onDeny}
+                className="px-3 py-1 border border-gray-600 text-gray-300 hover:border-gray-500 hover:text-white text-sm rounded cursor-pointer transition-colors"
+            >
+                {denyText}
+            </button>
+        </div>
+    );
+});
+
+AIToolApprovalButtons.displayName = "AIToolApprovalButtons";
+
+interface AIToolUseBatchItemProps {
+    part: WaveUIMessagePart & { type: "data-tooluse" };
+    effectiveApproval: string;
+}
+
+const AIToolUseBatchItem = memo(({ part, effectiveApproval }: AIToolUseBatchItemProps) => {
+    const statusIcon = part.data.status === "completed" ? "✓" : part.data.status === "error" ? "✗" : "•";
+    const statusColor =
+        part.data.status === "completed"
+            ? "text-success"
+            : part.data.status === "error"
+              ? "text-error"
+              : "text-gray-400";
+    const effectiveErrorMessage = part.data.errormessage || (effectiveApproval === "timeout" ? "Not approved" : null);
+    const imageUrl = part.data.imageurl;
+
+    const handleSaveImage = async () => {
+        if (!imageUrl) return;
+        try {
+            const resp = await fetch(imageUrl);
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `wove-image-${Date.now()}.jpg`;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            console.error("Failed to save image:", err);
+        }
+    };
+
+    return (
+        <div className="text-sm pl-2 flex flex-col gap-1">
+            <div className="flex items-start gap-1.5">
+                <span className={cn("font-bold flex-shrink-0", statusColor)}>{statusIcon}</span>
+                <div className="flex-1">
+                    <span className="text-gray-400">{part.data.tooldesc}</span>
+                    {effectiveErrorMessage && <div className="text-red-300 mt-0.5">{effectiveErrorMessage}</div>}
+                </div>
+            </div>
+            {imageUrl && (
+                <div className="ml-5 mt-1">
+                    <img
+                        src={imageUrl}
+                        alt="Generated image"
+                        className="max-w-full rounded-lg border border-gray-600 max-h-80"
+                        loading="lazy"
+                    />
+                    <button
+                        onClick={handleSaveImage}
+                        className="mt-1.5 px-3 py-1 text-xs border border-gray-600 text-gray-300 hover:border-gray-400 hover:text-white rounded cursor-pointer transition-colors flex items-center gap-1.5"
+                    >
+                        <i className="fa fa-download"></i>
+                        Save Image
+                    </button>
+                </div>
+            )}
+        </div>
+    );
+});
+
+AIToolUseBatchItem.displayName = "AIToolUseBatchItem";
+
+interface AIToolUseBatchProps {
+    parts: Array<WaveUIMessagePart & { type: "data-tooluse" }>;
+    isStreaming: boolean;
+}
+
+const AIToolUseBatch = memo(({ parts, isStreaming }: AIToolUseBatchProps) => {
+    const [userApprovalOverride, setUserApprovalOverride] = useState<string | null>(null);
+
+    const firstTool = parts[0].data;
+    const baseApproval = userApprovalOverride || firstTool.approval;
+    const effectiveApproval = getEffectiveApprovalStatus(baseApproval, isStreaming);
+
+    const handleApprove = () => {
+        setUserApprovalOverride("user-approved");
+        parts.forEach((part) => {
+            WaveAIModel.getInstance().toolUseSendApproval(part.data.toolcallid, "user-approved");
+        });
+    };
+
+    const handleDeny = () => {
+        setUserApprovalOverride("user-denied");
+        parts.forEach((part) => {
+            WaveAIModel.getInstance().toolUseSendApproval(part.data.toolcallid, "user-denied");
+        });
+    };
+
+    const isReadOp = parts.some(
+        (p) => p.data.toolname === "read_text_file" || p.data.toolname === "read_dir"
+    );
+    const isWriteOp = parts.some(
+        (p) => p.data.toolname === "write_text_file" || p.data.toolname === "edit_text_file"
+    );
+
+    const handleAllowSession = () => {
+        const dirs = extractDirsFromParts(parts);
+        const model = WaveAIModel.getInstance();
+        for (const dir of dirs) {
+            if (isReadOp) {
+                model.sessionReadApprove(dir);
+            }
+            if (isWriteOp) {
+                model.sessionWriteApprove(dir);
+            }
+        }
+        handleApprove();
+    };
+
+    const batchLabel = isWriteOp ? "Writing Files" : "Reading Files";
+    const sessionButtonLabel = isWriteOp ? "Allow writing in this session" : "Allow reading in this session";
+    const sessionButtonTitle = isWriteOp
+        ? "Auto-approve all file writes under this directory for the rest of this session"
+        : "Auto-approve all file reads under this directory for the rest of this session";
+
+    return (
+        <div className="flex items-start gap-2 p-2 rounded bg-zinc-800/60 border border-zinc-700">
+            <div className="flex-1">
+                <div className="font-semibold">{batchLabel}</div>
+                <div className="mt-1 space-y-0.5">
+                    {parts.map((part, idx) => (
+                        <AIToolUseBatchItem key={idx} part={part} effectiveApproval={effectiveApproval} />
+                    ))}
+                </div>
+                {effectiveApproval === "needs-approval" && (
+                    <AIToolApprovalButtons
+                        count={parts.length}
+                        onApprove={handleApprove}
+                        onDeny={handleDeny}
+                        onAllowSession={handleAllowSession}
+                        showSessionButton={isReadOp || isWriteOp}
+                        sessionButtonLabel={sessionButtonLabel}
+                        sessionButtonTitle={sessionButtonTitle}
+                    />
+                )}
+            </div>
+        </div>
+    );
+});
+
+AIToolUseBatch.displayName = "AIToolUseBatch";
+
+interface AIToolUseProps {
+    part: WaveUIMessagePart & { type: "data-tooluse" };
+    isStreaming: boolean;
+}
+
+const AIToolUse = memo(({ part, isStreaming }: AIToolUseProps) => {
+    const toolData = part.data;
+    const [userApprovalOverride, setUserApprovalOverride] = useState<string | null>(null);
+    const model = WaveAIModel.getInstance();
+    const restoreModalToolCallId = useAtomValue(model.restoreBackupModalToolCallId);
+    const showRestoreModal = restoreModalToolCallId === toolData.toolcallid;
+    const highlightTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const highlightedBlockIdRef = useRef<string | null>(null);
+
+    const statusIcon = toolData.status === "completed" ? "✓" : toolData.status === "error" ? "✗" : "•";
+    const statusColor =
+        toolData.status === "completed" ? "text-success" : toolData.status === "error" ? "text-error" : "text-gray-400";
+
+    const baseApproval = userApprovalOverride || toolData.approval;
+    const effectiveApproval = getEffectiveApprovalStatus(baseApproval, isStreaming);
+
+    const isFileWriteTool = toolData.toolname === "write_text_file" || toolData.toolname === "edit_text_file";
+
+    useEffect(() => {
+        return () => {
+            if (highlightTimeoutRef.current) {
+                clearTimeout(highlightTimeoutRef.current);
+            }
+        };
+    }, []);
+
+    const isReadTool = toolData.toolname === "read_text_file" || toolData.toolname === "read_dir";
+
+    const handleApprove = () => {
+        setUserApprovalOverride("user-approved");
+        WaveAIModel.getInstance().toolUseSendApproval(toolData.toolcallid, "user-approved");
+    };
+
+    const handleDeny = () => {
+        setUserApprovalOverride("user-denied");
+        WaveAIModel.getInstance().toolUseSendApproval(toolData.toolcallid, "user-denied");
+    };
+
+    const handleAllowSession = () => {
+        const dir = extractDirFromToolDesc(toolData.tooldesc);
+        if (dir) {
+            WaveAIModel.getInstance().sessionReadApprove(dir);
+        }
+        handleApprove();
+    };
+
+    const handleMouseEnter = () => {
+        if (!toolData.blockid) return;
+
+        if (highlightTimeoutRef.current) {
+            clearTimeout(highlightTimeoutRef.current);
+        }
+
+        highlightedBlockIdRef.current = toolData.blockid;
+        BlockModel.getInstance().setBlockHighlight({
+            blockId: toolData.blockid,
+            icon: "wand-magic-sparkles",
+        });
+
+        highlightTimeoutRef.current = setTimeout(() => {
+            if (highlightedBlockIdRef.current === toolData.blockid) {
+                BlockModel.getInstance().setBlockHighlight(null);
+                highlightedBlockIdRef.current = null;
+            }
+        }, 2000);
+    };
+
+    const handleMouseLeave = () => {
+        if (!toolData.blockid) return;
+
+        if (highlightTimeoutRef.current) {
+            clearTimeout(highlightTimeoutRef.current);
+            highlightTimeoutRef.current = null;
+        }
+
+        if (highlightedBlockIdRef.current === toolData.blockid) {
+            BlockModel.getInstance().setBlockHighlight(null);
+            highlightedBlockIdRef.current = null;
+        }
+    };
+
+    const handleOpenDiff = () => {
+        recordTEvent("waveai:showdiff");
+        fireAndForget(() => WaveAIModel.getInstance().openDiff(toolData.inputfilename, toolData.toolcallid));
+    };
+
+    return (
+        <div
+            className={cn("flex flex-col gap-1 p-2 rounded bg-zinc-800/60 border border-zinc-700", statusColor)}
+            onMouseEnter={handleMouseEnter}
+            onMouseLeave={handleMouseLeave}
+        >
+            <div className="flex items-center gap-2">
+                <span className="font-bold">{statusIcon}</span>
+                <div className="font-semibold">{toolData.toolname}</div>
+                <div className="flex-1" />
+                {isFileWriteTool &&
+                    toolData.inputfilename &&
+                    toolData.writebackupfilename &&
+                    toolData.runts &&
+                    Date.now() - toolData.runts < BackupRetentionDays * 24 * 60 * 60 * 1000 && (
+                        <button
+                            onClick={() => {
+                                recordTEvent("waveai:revertfile", { "waveai:action": "revertfile:open" });
+                                model.openRestoreBackupModal(toolData.toolcallid);
+                            }}
+                            className="flex-shrink-0 px-1.5 py-0.5 border border-zinc-600 hover:border-zinc-500 hover:bg-zinc-700 rounded cursor-pointer transition-colors flex items-center gap-1 text-zinc-400"
+                            title="Restore backup file"
+                        >
+                            <span className="text-xs">Revert File</span>
+                            <i className="fa fa-clock-rotate-left text-xs"></i>
+                        </button>
+                    )}
+                {isFileWriteTool && toolData.inputfilename && (
+                    <button
+                        onClick={handleOpenDiff}
+                        className="flex-shrink-0 px-1.5 py-0.5 border border-zinc-600 hover:border-zinc-500 hover:bg-zinc-700 rounded cursor-pointer transition-colors flex items-center gap-1 text-zinc-400"
+                        title="Open in diff viewer"
+                    >
+                        <span className="text-xs">Show Diff</span>
+                        <i className="fa fa-arrow-up-right-from-square text-xs"></i>
+                    </button>
+                )}
+            </div>
+            {toolData.tooldesc && <ToolDesc text={toolData.tooldesc} className="text-sm text-gray-400 pl-6" />}
+            {(toolData.errormessage || effectiveApproval === "timeout") && (
+                <div className="text-sm text-red-300 pl-6">{toolData.errormessage || "Not approved"}</div>
+            )}
+            {effectiveApproval === "needs-approval" && (
+                <div className="pl-6">
+                    <AIToolApprovalButtons
+                        count={1}
+                        onApprove={handleApprove}
+                        onDeny={handleDeny}
+                        onAllowSession={handleAllowSession}
+                        showSessionButton={isReadTool}
+                    />
+                </div>
+            )}
+            {showRestoreModal && <RestoreBackupModal part={part} />}
+        </div>
+    );
+});
+
+AIToolUse.displayName = "AIToolUse";
+
+interface AIToolProgressProps {
+    part: WaveUIMessagePart & { type: "data-toolprogress" };
+}
+
+const AIToolProgress = memo(({ part }: AIToolProgressProps) => {
+    const progressData = part.data;
+
+    return (
+        <div className="flex flex-col gap-1 p-2 rounded bg-zinc-800/60 border border-zinc-700">
+            <div className="flex items-center gap-2">
+                <i className="fa fa-spinner fa-spin text-gray-400"></i>
+                <div className="font-semibold">{progressData.toolname}</div>
+            </div>
+            {progressData.statuslines && progressData.statuslines.length > 0 && (
+                <ToolDesc text={progressData.statuslines} className="text-sm text-gray-400 pl-6 space-y-0.5" />
+            )}
+        </div>
+    );
+});
+
+AIToolProgress.displayName = "AIToolProgress";
+
+interface AIToolUseGroupProps {
+    parts: Array<WaveUIMessagePart & { type: "data-tooluse" | "data-toolprogress" }>;
+    isStreaming: boolean;
+}
+
+type ToolGroupItem =
+    | { type: "batch"; parts: Array<WaveUIMessagePart & { type: "data-tooluse" }> }
+    | { type: "single"; part: WaveUIMessagePart & { type: "data-tooluse" } }
+    | { type: "progress"; part: WaveUIMessagePart & { type: "data-toolprogress" } };
+
+export const AIToolUseGroup = memo(({ parts, isStreaming }: AIToolUseGroupProps) => {
+    const tooluseParts = parts.filter((p) => p.type === "data-tooluse") as Array<
+        WaveUIMessagePart & { type: "data-tooluse" }
+    >;
+    const toolprogressParts = parts.filter((p) => p.type === "data-toolprogress") as Array<
+        WaveUIMessagePart & { type: "data-toolprogress" }
+    >;
+
+    const tooluseCallIds = new Set(tooluseParts.map((p) => p.data.toolcallid));
+    const filteredProgressParts = toolprogressParts.filter((p) => !tooluseCallIds.has(p.data.toolcallid));
+
+    const isFileOp = (part: WaveUIMessagePart & { type: "data-tooluse" }) => {
+        const toolName = part.data?.toolname;
+        return toolName === "read_text_file" || toolName === "read_dir";
+    };
+
+    const needsApproval = (part: WaveUIMessagePart & { type: "data-tooluse" }) => {
+        return getEffectiveApprovalStatus(part.data?.approval, isStreaming) === "needs-approval";
+    };
+
+    const readFileNeedsApproval: Array<WaveUIMessagePart & { type: "data-tooluse" }> = [];
+    const readFileOther: Array<WaveUIMessagePart & { type: "data-tooluse" }> = [];
+
+    for (const part of tooluseParts) {
+        if (isFileOp(part)) {
+            if (needsApproval(part)) {
+                readFileNeedsApproval.push(part);
+            } else {
+                readFileOther.push(part);
+            }
+        }
+    }
+
+    const groupedItems: ToolGroupItem[] = [];
+    let addedApprovalBatch = false;
+    let addedOtherBatch = false;
+
+    for (const part of tooluseParts) {
+        const isFileOpPart = isFileOp(part);
+        const partNeedsApproval = needsApproval(part);
+
+        if (isFileOpPart && partNeedsApproval) {
+            if (!addedApprovalBatch) {
+                groupedItems.push({ type: "batch", parts: readFileNeedsApproval });
+                addedApprovalBatch = true;
+            }
+        } else if (isFileOpPart && !partNeedsApproval) {
+            if (!addedOtherBatch) {
+                groupedItems.push({ type: "batch", parts: readFileOther });
+                addedOtherBatch = true;
+            }
+        } else {
+            groupedItems.push({ type: "single", part });
+        }
+    }
+
+    filteredProgressParts.forEach((part) => {
+        groupedItems.push({ type: "progress", part });
+    });
+
+    return (
+        <>
+            {groupedItems.map((item, idx) => {
+                if (item.type === "batch") {
+                    return (
+                        <div key={idx} className="mt-2">
+                            <AIToolUseBatch parts={item.parts} isStreaming={isStreaming} />
+                        </div>
+                    );
+                } else if (item.type === "progress") {
+                    return (
+                        <div key={idx} className="mt-2">
+                            <AIToolProgress part={item.part} />
+                        </div>
+                    );
+                } else {
+                    return (
+                        <div key={idx} className="mt-2">
+                            <AIToolUse part={item.part} isStreaming={isStreaming} />
+                        </div>
+                    );
+                }
+            })}
+        </>
+    );
+});
+
+AIToolUseGroup.displayName = "AIToolUseGroup";

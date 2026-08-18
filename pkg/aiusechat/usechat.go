@@ -1,0 +1,1278 @@
+// Copyright 2025, Command Line Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+package aiusechat
+
+import (
+	"context"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/woveterm/wove/pkg/aiusechat/aiutil"
+	"github.com/woveterm/wove/pkg/aiusechat/aiplan"
+	"github.com/woveterm/wove/pkg/aiusechat/chatstore"
+	"github.com/woveterm/wove/pkg/aiusechat/projectctx"
+	"github.com/woveterm/wove/pkg/aiusechat/repomap"
+	"github.com/woveterm/wove/pkg/aiusechat/sessionhistory"
+	"github.com/woveterm/wove/pkg/aiusechat/skills"
+	"github.com/woveterm/wove/pkg/aiusechat/uctypes"
+	"github.com/woveterm/wove/pkg/secretstore"
+	"github.com/woveterm/wove/pkg/telemetry"
+	"github.com/woveterm/wove/pkg/telemetry/telemetrydata"
+	"github.com/woveterm/wove/pkg/util/ds"
+	"github.com/woveterm/wove/pkg/util/logutil"
+	"github.com/woveterm/wove/pkg/util/utilfn"
+	"github.com/woveterm/wove/pkg/waveappstore"
+	"github.com/woveterm/wove/pkg/wavebase"
+	"github.com/woveterm/wove/pkg/waveobj"
+	"github.com/woveterm/wove/pkg/web/sse"
+	"github.com/woveterm/wove/pkg/wps"
+	"github.com/woveterm/wove/pkg/wstore"
+)
+
+const DefaultAPI = uctypes.APIType_OpenAIResponses
+const DefaultMaxTokens = 16 * 1024
+const BuilderMaxTokens = 24 * 1024
+
+func init() {
+	sessionhistory.SaveAllCallback = saveAllSessionHistories
+	wstore.OnChatIdChangeCallback = onChatIdChange
+}
+
+var (
+	globalRateLimitInfo = &uctypes.RateLimitInfo{Unknown: true}
+	rateLimitLock       sync.Mutex
+
+	activeChats = ds.MakeSyncMap[bool]() // key is chatid
+)
+
+func getSystemPrompt(apiType string, model string, isBuilder bool, hasToolsCapability bool, widgetAccess bool, mcpAccess bool) []string {
+	if isBuilder {
+		return []string{}
+	}
+	useNoToolsPrompt := !hasToolsCapability || !widgetAccess
+	basePrompt := SystemPromptText_OpenAI
+	if useNoToolsPrompt {
+		basePrompt = SystemPromptText_NoTools
+	}
+	dateInfo := fmt.Sprintf("Current date: %s", time.Now().Format("2006-01-02 (Monday)"))
+	prompts := []string{basePrompt, dateInfo}
+	if !useNoToolsPrompt {
+		prompts = append(prompts, SystemPromptText_StrictToolAddOn)
+	}
+	if apiType == uctypes.APIType_GoogleGemini {
+		prompts = append(prompts, SystemPromptText_GeminiAddOn)
+	}
+	if mcpAccess {
+		prompts = append(prompts, SystemPromptText_MCPAddOn)
+	}
+	return prompts
+}
+
+func isLocalEndpoint(endpoint string) bool {
+	if endpoint == "" {
+		return false
+	}
+	endpointLower := strings.ToLower(endpoint)
+	return strings.Contains(endpointLower, "localhost") || strings.Contains(endpointLower, "127.0.0.1")
+}
+
+func getWaveAISettings(premium bool, builderMode bool, rtInfo waveobj.ObjRTInfo, aiModeName string) (*uctypes.AIOptsType, error) {
+	maxTokens := DefaultMaxTokens
+	if builderMode {
+		maxTokens = BuilderMaxTokens
+	}
+	if rtInfo.WaveAIMaxOutputTokens > 0 {
+		maxTokens = rtInfo.WaveAIMaxOutputTokens
+	}
+	aiMode, config, err := resolveAIMode(aiModeName, premium)
+	if err != nil {
+		return nil, err
+	}
+	if config.WaveAICloud && !telemetry.IsTelemetryEnabled() {
+		return nil, fmt.Errorf("Wave AI cloud modes require telemetry to be enabled")
+	}
+	apiToken := config.APIToken
+	if apiToken == "" && config.APITokenSecretName != "" {
+		secret, exists, err := secretstore.GetSecret(config.APITokenSecretName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve secret %s: %w", config.APITokenSecretName, err)
+		}
+		secret = strings.TrimSpace(secret)
+		if !exists || secret == "" {
+			return nil, fmt.Errorf("secret %s not found or empty", config.APITokenSecretName)
+		}
+		apiToken = secret
+	}
+
+	var baseUrl string
+	if config.Endpoint != "" {
+		baseUrl = config.Endpoint
+	} else {
+		return nil, fmt.Errorf("no ai:endpoint configured for AI mode %s", aiMode)
+	}
+
+	thinkingLevel := config.ThinkingLevel
+	if thinkingLevel == "" {
+		thinkingLevel = uctypes.ThinkingLevelMedium
+	}
+	verbosity := config.Verbosity
+	if verbosity == "" {
+		verbosity = uctypes.VerbosityLevelMedium // default to medium
+	}
+	opts := &uctypes.AIOptsType{
+		Provider:      config.Provider,
+		APIType:       config.APIType,
+		Model:         config.Model,
+		MaxTokens:     maxTokens,
+		ThinkingLevel: thinkingLevel,
+		Verbosity:     verbosity,
+		AIMode:        aiMode,
+		Endpoint:      baseUrl,
+		ProxyURL:      config.ProxyURL,
+		Capabilities:  config.Capabilities,
+		WaveAIPremium: config.WaveAIPremium,
+	}
+	if apiToken != "" {
+		opts.APIToken = apiToken
+	}
+	return opts, nil
+}
+
+func shouldUseChatCompletionsAPI(model string) bool {
+	m := strings.ToLower(model)
+	// Chat Completions API is required for older models: gpt-3.5-*, gpt-4, gpt-4-turbo, o1-*
+	return strings.HasPrefix(m, "gpt-3.5") ||
+		strings.HasPrefix(m, "gpt-4-") ||
+		m == "gpt-4" ||
+		strings.HasPrefix(m, "o1-")
+}
+
+func shouldUsePremium() bool {
+	info := GetGlobalRateLimit()
+	if info == nil || info.Unknown {
+		return true
+	}
+	if info.PReq > 0 {
+		return true
+	}
+	nowEpoch := time.Now().Unix()
+	if nowEpoch >= info.ResetEpoch {
+		return true
+	}
+	return false
+}
+
+func updateRateLimit(info *uctypes.RateLimitInfo) {
+	if info == nil {
+		return
+	}
+	rateLimitLock.Lock()
+	defer rateLimitLock.Unlock()
+	globalRateLimitInfo = info
+	go func() {
+		wps.Broker.Publish(wps.WaveEvent{
+			Event: wps.Event_WaveAIRateLimit,
+			Data:  info,
+		})
+	}()
+}
+
+func GetGlobalRateLimit() *uctypes.RateLimitInfo {
+	rateLimitLock.Lock()
+	defer rateLimitLock.Unlock()
+	return globalRateLimitInfo
+}
+
+const DefaultAITimeoutMs = 180000 // 180 seconds default timeout for AI requests (increased from 90s for large contexts)
+
+func runAIChatStep(ctx context.Context, sseHandler *sse.SSEHandlerCh, backend UseChatBackend, chatOpts uctypes.WaveChatOpts, cont *uctypes.WaveContinueResponse) (*uctypes.WaveStopReason, []uctypes.GenAIMessage, error) {
+	if chatOpts.Config.APIType == uctypes.APIType_OpenAIResponses && shouldUseChatCompletionsAPI(chatOpts.Config.Model) {
+		return nil, nil, fmt.Errorf("Chat completions API not available (must use newer OpenAI models)")
+	}
+	// Apply default timeout if none is configured
+	if chatOpts.Config.TimeoutMs <= 0 {
+		chatOpts.Config.TimeoutMs = DefaultAITimeoutMs
+	}
+	stopReason, messages, rateLimitInfo, err := backend.RunChatStep(ctx, sseHandler, chatOpts, cont)
+	updateRateLimit(rateLimitInfo)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, fmt.Errorf("request timed out - check your internet connection and try again")
+		}
+	}
+	return stopReason, messages, err
+}
+
+func getUsage(msgs []uctypes.GenAIMessage) uctypes.AIUsage {
+	var rtn uctypes.AIUsage
+	var found bool
+	for _, msg := range msgs {
+		if usage := msg.GetUsage(); usage != nil {
+			if !found {
+				rtn = *usage
+				found = true
+			} else {
+				rtn.InputTokens += usage.InputTokens
+				rtn.OutputTokens += usage.OutputTokens
+				rtn.NativeWebSearchCount += usage.NativeWebSearchCount
+			}
+		}
+	}
+	return rtn
+}
+
+func GetChatUsage(chat *uctypes.AIChat) uctypes.AIUsage {
+	usage := getUsage(chat.NativeMessages)
+	usage.APIType = chat.APIType
+	usage.Model = chat.Model
+	return usage
+}
+
+func updateToolUseDataInChat(backend UseChatBackend, chatOpts uctypes.WaveChatOpts, toolCallID string, toolUseData uctypes.UIMessageDataToolUse) {
+	if err := backend.UpdateToolUseData(chatOpts.ChatId, toolCallID, toolUseData); err != nil {
+		log.Printf("failed to update tool use data in chat: %v\n", err)
+	}
+}
+
+func processToolCallInternal(backend UseChatBackend, toolCall uctypes.WaveToolCall, chatOpts uctypes.WaveChatOpts, toolDef *uctypes.ToolDefinition, sseHandler *sse.SSEHandlerCh) uctypes.AIToolResult {
+	if toolCall.ToolUseData == nil {
+		return uctypes.AIToolResult{
+			ToolName:  toolCall.Name,
+			ToolUseID: toolCall.ID,
+			ErrorText: "Invalid Tool Call",
+		}
+	}
+
+	if toolCall.ToolUseData.Status == uctypes.ToolUseStatusError {
+		errorMsg := toolCall.ToolUseData.ErrorMessage
+		if errorMsg == "" {
+			errorMsg = "Unspecified Tool Error"
+		}
+		return uctypes.AIToolResult{
+			ToolName:  toolCall.Name,
+			ToolUseID: toolCall.ID,
+			ErrorText: errorMsg,
+		}
+	}
+
+	if toolDef != nil && toolDef.ToolVerifyInput != nil {
+		if err := toolDef.ToolVerifyInput(toolCall.Input, toolCall.ToolUseData); err != nil {
+			errorMsg := fmt.Sprintf("Input validation failed: %v", err)
+			toolCall.ToolUseData.Status = uctypes.ToolUseStatusError
+			toolCall.ToolUseData.ErrorMessage = errorMsg
+			return uctypes.AIToolResult{
+				ToolName:  toolCall.Name,
+				ToolUseID: toolCall.ID,
+				ErrorText: errorMsg,
+			}
+		}
+		// ToolVerifyInput can modify the toolusedata.  re-send it here.
+		_ = sseHandler.AiMsgData("data-tooluse", toolCall.ID, *toolCall.ToolUseData)
+		updateToolUseDataInChat(backend, chatOpts, toolCall.ID, *toolCall.ToolUseData)
+	}
+
+	if toolCall.ToolUseData.Approval == uctypes.ApprovalNeedsApproval {
+		log.Printf("  waiting for approval...\n")
+		approval, err := WaitForToolApproval(sseHandler.Context(), toolCall.ID)
+		if err != nil || approval == "" {
+			approval = uctypes.ApprovalCanceled
+		}
+		log.Printf("  approval result: %q\n", approval)
+		toolCall.ToolUseData.Approval = approval
+
+		if !toolCall.ToolUseData.IsApproved() {
+			errorMsg := "Tool use denied or timed out"
+			if approval == uctypes.ApprovalUserDenied {
+				errorMsg = "Tool use denied by user"
+			} else if approval == uctypes.ApprovalTimeout {
+				errorMsg = "Tool approval timed out"
+			} else if approval == uctypes.ApprovalCanceled {
+				errorMsg = "Tool approval canceled"
+			}
+			toolCall.ToolUseData.Status = uctypes.ToolUseStatusError
+			toolCall.ToolUseData.ErrorMessage = errorMsg
+			return uctypes.AIToolResult{
+				ToolName:  toolCall.Name,
+				ToolUseID: toolCall.ID,
+				ErrorText: errorMsg,
+			}
+		}
+
+		// this still happens here because we need to update the FE to say the tool call was approved
+		_ = sseHandler.AiMsgData("data-tooluse", toolCall.ID, *toolCall.ToolUseData)
+		updateToolUseDataInChat(backend, chatOpts, toolCall.ID, *toolCall.ToolUseData)
+	}
+
+	toolCall.ToolUseData.RunTs = time.Now().UnixMilli()
+	result := ResolveToolCall(toolDef, toolCall, chatOpts)
+
+	if result.ErrorText != "" {
+		toolCall.ToolUseData.Status = uctypes.ToolUseStatusError
+		toolCall.ToolUseData.ErrorMessage = result.ErrorText
+	} else {
+		toolCall.ToolUseData.Status = uctypes.ToolUseStatusCompleted
+		// Track modified files for the session
+		if toolCall.ToolUseData.InputFileName != "" {
+			var action string
+			switch toolCall.Name {
+			case "write_text_file":
+				action = "write"
+			case "edit_text_file":
+				action = "edit"
+			case "delete_text_file":
+				action = "delete"
+			}
+			if action != "" {
+				TrackModifiedFile(chatOpts.ChatId, toolCall.ToolUseData.InputFileName, action)
+			}
+		}
+	}
+
+	return result
+}
+
+func processToolCall(backend UseChatBackend, toolCall uctypes.WaveToolCall, chatOpts uctypes.WaveChatOpts, sseHandler *sse.SSEHandlerCh, metrics *uctypes.AIMetrics) uctypes.AIToolResult {
+	inputJSON, _ := json.Marshal(toolCall.Input)
+	logutil.DevPrintf("TOOLUSE name=%s id=%s input=%s approval=%q\n", toolCall.Name, toolCall.ID, utilfn.TruncateString(string(inputJSON), 40), toolCall.ToolUseData.Approval)
+
+	toolDef := chatOpts.GetToolDefinition(toolCall.Name)
+	result := processToolCallInternal(backend, toolCall, chatOpts, toolDef, sseHandler)
+
+	if result.ErrorText != "" {
+		log.Printf("  error=%s\n", result.ErrorText)
+		metrics.ToolUseErrorCount++
+	} else {
+		log.Printf("  result=%s\n", utilfn.TruncateString(result.Text, 40))
+	}
+
+	if toolDef != nil && toolDef.ToolLogName != "" {
+		metrics.ToolDetail[toolDef.ToolLogName]++
+	}
+
+	if toolCall.ToolUseData != nil {
+		_ = sseHandler.AiMsgData("data-tooluse", toolCall.ID, *toolCall.ToolUseData)
+		updateToolUseDataInChat(backend, chatOpts, toolCall.ID, *toolCall.ToolUseData)
+	}
+
+	return result
+}
+
+// processAllToolCalls executes tool calls and returns file extensions of modified files (for warm context injection).
+func processAllToolCalls(backend UseChatBackend, stopReason *uctypes.WaveStopReason, chatOpts uctypes.WaveChatOpts, sseHandler *sse.SSEHandlerCh, metrics *uctypes.AIMetrics) []string {
+	// Create and send all data-tooluse packets at the beginning
+	for i := range stopReason.ToolCalls {
+		toolCall := &stopReason.ToolCalls[i]
+		// Create toolUseData from the tool call input
+		var argsJSON string
+		if toolCall.Input != nil {
+			argsBytes, err := json.Marshal(toolCall.Input)
+			if err == nil {
+				argsJSON = string(argsBytes)
+			}
+		}
+		toolUseData := aiutil.CreateToolUseData(toolCall.ID, toolCall.Name, argsJSON, chatOpts)
+		stopReason.ToolCalls[i].ToolUseData = &toolUseData
+		log.Printf("AI data-tooluse %s\n", toolCall.ID)
+		_ = sseHandler.AiMsgData("data-tooluse", toolCall.ID, toolUseData)
+		updateToolUseDataInChat(backend, chatOpts, toolCall.ID, toolUseData)
+		if toolUseData.Approval == uctypes.ApprovalNeedsApproval {
+			RegisterToolApproval(toolCall.ID, sseHandler)
+		}
+	}
+	// At this point, all ToolCalls are guaranteed to have non-nil ToolUseData
+
+	toolResults := make([]uctypes.AIToolResult, len(stopReason.ToolCalls))
+	// Track file extensions of modified files for warm context injection
+	modifiedExts := make(map[string]bool)
+
+	// Run tool calls in parallel when multiple are requested (like ForgeCode)
+	if len(stopReason.ToolCalls) > 1 && chatOpts.AutoApproveTools {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for i, toolCall := range stopReason.ToolCalls {
+			if sseHandler.Err() != nil {
+				break
+			}
+			wg.Add(1)
+			go func(idx int, tc uctypes.WaveToolCall) {
+				defer wg.Done()
+				result := processToolCall(backend, tc, chatOpts, sseHandler, metrics)
+				mu.Lock()
+				toolResults[idx] = result
+				if tc.Name == "write_text_file" || tc.Name == "edit_text_file" {
+					if inputMap, ok := tc.Input.(map[string]any); ok {
+						if filename, ok := inputMap["filename"].(string); ok {
+							ext := filepath.Ext(filename)
+							if ext != "" {
+								modifiedExts[ext] = true
+							}
+						}
+					}
+				}
+				mu.Unlock()
+			}(i, toolCall)
+		}
+		wg.Wait()
+	} else {
+		// Sequential execution (GUI mode or single tool call)
+		for i, toolCall := range stopReason.ToolCalls {
+			if sseHandler.Err() != nil {
+				log.Printf("AI tool processing stopped: %v\n", sseHandler.Err())
+				break
+			}
+			toolResults[i] = processToolCall(backend, toolCall, chatOpts, sseHandler, metrics)
+			if toolCall.Name == "write_text_file" || toolCall.Name == "edit_text_file" {
+				if inputMap, ok := toolCall.Input.(map[string]any); ok {
+					if filename, ok := inputMap["filename"].(string); ok {
+						ext := filepath.Ext(filename)
+						if ext != "" {
+							modifiedExts[ext] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Cleanup: unregister approvals, remove incomplete/canceled tool calls, and filter results
+	var filteredResults []uctypes.AIToolResult
+	for i, toolCall := range stopReason.ToolCalls {
+		UnregisterToolApproval(toolCall.ID)
+		hasResult := i < len(toolResults)
+		shouldRemove := !hasResult || (toolCall.ToolUseData != nil && toolCall.ToolUseData.Approval == uctypes.ApprovalCanceled)
+		if shouldRemove {
+			backend.RemoveToolUseCall(chatOpts.ChatId, toolCall.ID)
+		} else if hasResult {
+			filteredResults = append(filteredResults, toolResults[i])
+		}
+	}
+
+	if len(filteredResults) > 0 {
+		toolResultMsgs, err := backend.ConvertToolResultsToNativeChatMessage(filteredResults)
+		if err != nil {
+			log.Printf("Failed to convert tool results to native chat messages: %v", err)
+		} else {
+			for _, msg := range toolResultMsgs {
+				if err := chatstore.DefaultChatStore.PostMessage(chatOpts.ChatId, &chatOpts.Config, msg); err != nil {
+					log.Printf("Failed to post tool result message: %v", err)
+				}
+			}
+		}
+	}
+
+	// Return unique extensions of modified files
+	var exts []string
+	for ext := range modifiedExts {
+		exts = append(exts, ext)
+	}
+	return exts
+}
+
+func RunAIChat(ctx context.Context, sseHandler *sse.SSEHandlerCh, backend UseChatBackend, chatOpts uctypes.WaveChatOpts) (*uctypes.AIMetrics, error) {
+	if !activeChats.SetUnless(chatOpts.ChatId, true) {
+		return nil, fmt.Errorf("chat %s is already running", chatOpts.ChatId)
+	}
+	defer activeChats.Delete(chatOpts.ChatId)
+
+	stepNum := chatstore.DefaultChatStore.CountUserMessages(chatOpts.ChatId)
+	aiProvider := chatOpts.Config.Provider
+	if aiProvider == "" {
+		aiProvider = uctypes.AIProvider_Custom
+	}
+	isLocal := isLocalEndpoint(chatOpts.Config.Endpoint)
+	metrics := &uctypes.AIMetrics{
+		ChatId:  chatOpts.ChatId,
+		StepNum: stepNum,
+		Usage: uctypes.AIUsage{
+			APIType: chatOpts.Config.APIType,
+			Model:   chatOpts.Config.Model,
+		},
+		WidgetAccess:  chatOpts.WidgetAccess,
+		ToolDetail:    make(map[string]int),
+		ThinkingLevel: chatOpts.Config.ThinkingLevel,
+		AIMode:        chatOpts.Config.AIMode,
+		AIProvider:    aiProvider,
+		IsLocal:       isLocal,
+	}
+	firstStep := true
+	var cont *uctypes.WaveContinueResponse
+	var actionHistory []string // structured history for ForgeCode-style compaction summaries
+	for {
+		// Compact conversation when content exceeds threshold (prevents context overflow on long sessions)
+		compactThreshold := chatOpts.CompactThreshold
+		if compactThreshold <= 0 {
+			compactThreshold = 60000 // default 60KB
+		}
+		if totalSize := chatstore.DefaultChatStore.GetTotalContentSize(chatOpts.ChatId); totalSize > compactThreshold {
+			compacted := chatstore.DefaultChatStore.CompactConversation(chatOpts.ChatId, compactThreshold, 4, 1000, 500)
+			if compacted > 0 {
+				log.Printf("[context] compacted %d messages, total was %d bytes\n", compacted, totalSize)
+				// Inject structured history summary so agent remembers what it did
+				if len(actionHistory) > 0 {
+					summary := "<compacted_history>\nPrevious actions (older messages were compacted to save context):\n"
+					// Keep last 30 actions max
+					start := 0
+					if len(actionHistory) > 30 {
+						start = len(actionHistory) - 30
+					}
+					for _, action := range actionHistory[start:] {
+						summary += "- " + action + "\n"
+					}
+					summary += "</compacted_history>"
+					chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, summary)
+				}
+				// Notify frontend about context compaction
+				_ = sseHandler.AiMsgData("data-compact", "", map[string]any{
+					"compacted_messages": compacted,
+					"total_size_before":  totalSize,
+				})
+			}
+		}
+		if chatOpts.TabStateGenerator != nil {
+			tabState, tabTools, tabId, tabErr := chatOpts.TabStateGenerator()
+			if tabErr == nil {
+				chatOpts.TabState = tabState
+				chatOpts.TabTools = tabTools
+				chatOpts.TabId = tabId
+			}
+		}
+		if chatOpts.BuilderAppGenerator != nil {
+			appGoFile, appStaticFiles, platformInfo, appErr := chatOpts.BuilderAppGenerator()
+			if appErr == nil {
+				chatOpts.AppGoFile = appGoFile
+				chatOpts.AppStaticFiles = appStaticFiles
+				chatOpts.PlatformInfo = platformInfo
+			}
+		}
+		if chatOpts.MCPAccess && firstStep {
+			mcpState, mcpTools, mcpErr := generateMCPStateAndTools(chatOpts)
+			if mcpErr == nil {
+				chatOpts.MCPState = mcpState
+				chatOpts.MCPTools = mcpTools
+			} else {
+				log.Printf("[mcp] warning: failed to generate MCP context: %v\n", mcpErr)
+			}
+		}
+		// Per-step timeout (bench: 300s to prevent single stalled stream from eating all time)
+		stepCtx := ctx
+		var stepCancel context.CancelFunc
+		if chatOpts.StepTimeoutSec > 0 {
+			stepCtx, stepCancel = context.WithTimeout(ctx, time.Duration(chatOpts.StepTimeoutSec)*time.Second)
+		}
+		stopReason, rtnMessages, err := runAIChatStep(stepCtx, sseHandler, backend, chatOpts, cont)
+		if stepCancel != nil {
+			stepCancel()
+		}
+		metrics.RequestCount++
+		if chatOpts.Config.IsWaveProxy() {
+			metrics.ProxyReqCount++
+			if chatOpts.Config.IsPremiumModel() {
+				metrics.PremiumReqCount++
+			}
+		}
+		if stopReason != nil {
+			logutil.DevPrintf("stopreason: %s (%s) (%s) (%s)\n", stopReason.Kind, stopReason.ErrorText, stopReason.ErrorType, stopReason.RawReason)
+		}
+		if len(rtnMessages) > 0 {
+			usage := getUsage(rtnMessages)
+			log.Printf("usage: input=%d output=%d websearch=%d\n", usage.InputTokens, usage.OutputTokens, usage.NativeWebSearchCount)
+			metrics.Usage.InputTokens += usage.InputTokens
+			metrics.Usage.OutputTokens += usage.OutputTokens
+			metrics.Usage.NativeWebSearchCount += usage.NativeWebSearchCount
+			if usage.Model != "" && metrics.Usage.Model != usage.Model {
+				metrics.Usage.Model = "mixed"
+			}
+		}
+		if firstStep && err != nil {
+			metrics.HadError = true
+			return metrics, fmt.Errorf("failed to stream %s chat: %w", chatOpts.Config.APIType, err)
+		}
+		if err != nil {
+			metrics.HadError = true
+			_ = sseHandler.AiMsgError(err.Error())
+			_ = sseHandler.AiMsgFinish("", nil)
+			break
+		}
+		for _, msg := range rtnMessages {
+			if msg != nil {
+				if err := chatstore.DefaultChatStore.PostMessage(chatOpts.ChatId, &chatOpts.Config, msg); err != nil {
+					log.Printf("Failed to post message: %v", err)
+				}
+			}
+		}
+		firstStep = false
+		if stopReason != nil && stopReason.Kind == uctypes.StopKindPremiumRateLimit && chatOpts.Config.APIType == uctypes.APIType_OpenAIResponses && chatOpts.Config.Model == uctypes.PremiumOpenAIModel {
+			log.Printf("Premium rate limit hit with %s, switching to %s\n", uctypes.PremiumOpenAIModel, uctypes.DefaultOpenAIModel)
+			cont = &uctypes.WaveContinueResponse{
+				Model:            uctypes.DefaultOpenAIModel,
+				ContinueFromKind: uctypes.StopKindPremiumRateLimit,
+			}
+			continue
+		}
+		// ForgeCode-style continuation: if model didn't explicitly stop and has no tool calls,
+		// continue the loop (model may be "thinking" without acting yet).
+		// Only applies to bench/headless mode (AutoApproveTools = true).
+		if stopReason != nil && stopReason.Kind != uctypes.StopKindDone && stopReason.Kind != uctypes.StopKindToolUse &&
+			stopReason.Kind != uctypes.StopKindError && stopReason.Kind != uctypes.StopKindCanceled &&
+			chatOpts.AutoApproveTools {
+			log.Printf("[continuation] model returned %s without tool calls — continuing (turn %d)\n", stopReason.Kind, metrics.RequestCount)
+			cont = &uctypes.WaveContinueResponse{
+				Model:            chatOpts.Config.Model,
+				ContinueFromKind: stopReason.Kind,
+			}
+			continue
+		}
+		if stopReason != nil && stopReason.Kind == uctypes.StopKindToolUse {
+			metrics.ToolUseCount += len(stopReason.ToolCalls)
+			// Track tool calls for structured compaction summary
+			for _, tc := range stopReason.ToolCalls {
+				argSummary := ""
+				if inputMap, ok := tc.Input.(map[string]any); ok {
+					// Extract key argument for summary
+					for _, key := range []string{"command", "filename", "path", "pattern"} {
+						if v, ok := inputMap[key].(string); ok && v != "" {
+							if len(v) > 80 {
+								v = v[:80] + "..."
+							}
+							argSummary = v
+							break
+						}
+					}
+				}
+				if argSummary != "" {
+					actionHistory = append(actionHistory, fmt.Sprintf("%s: %s", tc.Name, argSummary))
+				} else {
+					actionHistory = append(actionHistory, tc.Name)
+				}
+			}
+			modifiedExts := processAllToolCalls(backend, stopReason, chatOpts, sseHandler, metrics)
+			// Compact tool results to prevent context window overflow.
+			// 1. Truncate ALL oversized tool results (>5KB) to 2KB regardless of recency
+			chatstore.DefaultChatStore.CompactLargeToolResults(chatOpts.ChatId, 5000, 2000)
+			// 2. Keep the 4 most recent tool results at full length, truncate older ones to 2KB
+			chatstore.DefaultChatStore.CompactOldToolResults(chatOpts.ChatId, 4, 2000)
+			// Inject warm context for modified file types (technology-filtered WAVE.md/CLAUDE.md sections)
+			if len(modifiedExts) > 0 {
+				cwd := ""
+				if chatOpts.TabId != "" {
+					cwd = getTerminalCwd(ctx, chatOpts.TabId)
+				}
+				if cwd != "" {
+					for _, ext := range modifiedExts {
+						warmCtx := projectctx.ExtractWarmContext(cwd, ext, 2000)
+						if warmCtx != "" {
+							chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, warmCtx)
+						}
+					}
+				}
+			}
+			// Context usage warning: after many iterations, remind the model to use sub-tasks
+			if metrics.RequestCount >= 8 && chatOpts.SubTaskDepth == 0 {
+				contextHint := fmt.Sprintf("<context_warning>You have made %d API requests in this conversation. Context window may be filling up. For remaining complex steps, consider using run_sub_task to execute them in isolated conversations to prevent context overflow.</context_warning>", metrics.RequestCount)
+				chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, contextHint)
+			}
+			cont = &uctypes.WaveContinueResponse{
+				Model:            chatOpts.Config.Model,
+				ContinueFromKind: uctypes.StopKindToolUse,
+			}
+			continue
+		}
+		break
+	}
+	return metrics, nil
+}
+
+func ResolveToolCall(toolDef *uctypes.ToolDefinition, toolCall uctypes.WaveToolCall, chatOpts uctypes.WaveChatOpts) (result uctypes.AIToolResult) {
+	result = uctypes.AIToolResult{
+		ToolName:  toolCall.Name,
+		ToolUseID: toolCall.ID,
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			result.ErrorText = fmt.Sprintf("panic in tool execution: %v", r)
+			result.Text = ""
+		}
+	}()
+
+	if toolDef == nil {
+		result.ErrorText = fmt.Sprintf("tool '%s' not found", toolCall.Name)
+		return
+	}
+
+	// Try ToolTextCallback first, then ToolImageTextCallback, then ToolAnyCallback
+	if toolDef.ToolTextCallback != nil {
+		text, err := toolDef.ToolTextCallback(toolCall.Input)
+		if err != nil {
+			result.ErrorText = err.Error()
+		} else {
+			result.Text = text
+			// Recompute tool description with the result
+			if toolDef.ToolCallDesc != nil && toolCall.ToolUseData != nil {
+				toolCall.ToolUseData.ToolDesc = toolDef.ToolCallDesc(toolCall.Input, text, toolCall.ToolUseData)
+			}
+		}
+	} else if toolDef.ToolImageTextCallback != nil {
+		text, imageUrl, err := toolDef.ToolImageTextCallback(toolCall.Input)
+		if err != nil {
+			result.ErrorText = err.Error()
+		} else {
+			result.Text = text
+			result.ImageUrl = imageUrl
+			if toolCall.ToolUseData != nil {
+				// Expose the image to the chat UI so it renders in history alongside the tool call
+				toolCall.ToolUseData.ImageUrl = imageUrl
+				if toolDef.ToolCallDesc != nil {
+					toolCall.ToolUseData.ToolDesc = toolDef.ToolCallDesc(toolCall.Input, text, toolCall.ToolUseData)
+				}
+			}
+		}
+	} else if toolDef.ToolAnyCallback != nil {
+		output, err := toolDef.ToolAnyCallback(toolCall.Input, toolCall.ToolUseData)
+		if err != nil {
+			result.ErrorText = err.Error()
+		} else {
+			// Marshal the result to JSON
+			jsonBytes, marshalErr := json.Marshal(output)
+			if marshalErr != nil {
+				result.ErrorText = fmt.Sprintf("failed to marshal tool output: %v", marshalErr)
+			} else {
+				result.Text = string(jsonBytes)
+				// Recompute tool description with the result
+				if toolDef.ToolCallDesc != nil && toolCall.ToolUseData != nil {
+					toolCall.ToolUseData.ToolDesc = toolDef.ToolCallDesc(toolCall.Input, output, toolCall.ToolUseData)
+				}
+			}
+		}
+	} else {
+		result.ErrorText = fmt.Sprintf("tool '%s' has no callback functions", toolCall.Name)
+	}
+
+	return
+}
+
+func WaveAIPostMessageWrap(ctx context.Context, sseHandler *sse.SSEHandlerCh, message *uctypes.AIMessage, chatOpts uctypes.WaveChatOpts) error {
+	startTime := time.Now()
+
+	// Convert AIMessage to native chat message using backend
+	backend, err := GetBackendByAPIType(chatOpts.Config.APIType)
+	if err != nil {
+		return err
+	}
+	convertedMessage, err := backend.ConvertAIMessageToNativeChatMessage(*message)
+	if err != nil {
+		return fmt.Errorf("message conversion failed: %w", err)
+	}
+
+	// Post message to chat store
+	if err := chatstore.DefaultChatStore.PostMessage(chatOpts.ChatId, &chatOpts.Config, convertedMessage); err != nil {
+		return fmt.Errorf("failed to store message: %w", err)
+	}
+
+	metrics, err := RunAIChat(ctx, sseHandler, backend, chatOpts)
+	if metrics != nil {
+		metrics.RequestDuration = int(time.Since(startTime).Milliseconds())
+		for _, part := range message.Parts {
+			if part.Type == uctypes.AIMessagePartTypeText {
+				metrics.TextLen += len(part.Text)
+			} else if part.Type == uctypes.AIMessagePartTypeFile {
+				mimeType := strings.ToLower(part.MimeType)
+				if strings.HasPrefix(mimeType, "image/") {
+					metrics.ImageCount++
+				} else if mimeType == "application/pdf" {
+					metrics.PDFCount++
+				} else {
+					metrics.TextDocCount++
+				}
+			}
+		}
+		log.Printf("WaveAI call metrics: requests=%d tools=%d premium=%d proxy=%d images=%d pdfs=%d textdocs=%d textlen=%d duration=%dms error=%v\n",
+			metrics.RequestCount, metrics.ToolUseCount, metrics.PremiumReqCount, metrics.ProxyReqCount,
+			metrics.ImageCount, metrics.PDFCount, metrics.TextDocCount, metrics.TextLen, metrics.RequestDuration, metrics.HadError)
+
+		sendAIMetricsTelemetry(ctx, metrics)
+	}
+	return err
+}
+
+func sendAIMetricsTelemetry(ctx context.Context, metrics *uctypes.AIMetrics) {
+	event := telemetrydata.MakeTEvent("waveai:post", telemetrydata.TEventProps{
+		WaveAIAPIType:              metrics.Usage.APIType,
+		WaveAIModel:                metrics.Usage.Model,
+		WaveAIChatId:               metrics.ChatId,
+		WaveAIStepNum:              metrics.StepNum,
+		WaveAIInputTokens:          metrics.Usage.InputTokens,
+		WaveAIOutputTokens:         metrics.Usage.OutputTokens,
+		WaveAINativeWebSearchCount: metrics.Usage.NativeWebSearchCount,
+		WaveAIRequestCount:         metrics.RequestCount,
+		WaveAIToolUseCount:         metrics.ToolUseCount,
+		WaveAIToolUseErrorCount:    metrics.ToolUseErrorCount,
+		WaveAIToolDetail:           metrics.ToolDetail,
+		WaveAIPremiumReq:           metrics.PremiumReqCount,
+		WaveAIProxyReq:             metrics.ProxyReqCount,
+		WaveAIHadError:             metrics.HadError,
+		WaveAIImageCount:           metrics.ImageCount,
+		WaveAIPDFCount:             metrics.PDFCount,
+		WaveAITextDocCount:         metrics.TextDocCount,
+		WaveAITextLen:              metrics.TextLen,
+		WaveAIFirstByteMs:          metrics.FirstByteLatency,
+		WaveAIRequestDurMs:         metrics.RequestDuration,
+		WaveAIWidgetAccess:         metrics.WidgetAccess,
+		WaveAIThinkingLevel:        metrics.ThinkingLevel,
+		WaveAIMode:                 metrics.AIMode,
+		WaveAIProvider:             metrics.AIProvider,
+		WaveAIIsLocal:              metrics.IsLocal,
+	})
+	_ = telemetry.RecordTEvent(ctx, event)
+}
+
+// PostMessageRequest represents the request body for posting a message
+type PostMessageRequest struct {
+	TabId        string            `json:"tabid,omitempty"`
+	BuilderId    string            `json:"builderid,omitempty"`
+	BuilderAppId string            `json:"builderappid,omitempty"`
+	ChatID       string            `json:"chatid"`
+	Msg          uctypes.AIMessage `json:"msg"`
+	WidgetAccess bool              `json:"widgetaccess,omitempty"`
+	MCPAccess    bool              `json:"mcpaccess,omitempty"`
+	MCPCwd       string            `json:"mcpcwd,omitempty"`
+	AIMode       string            `json:"aimode"`
+}
+
+func WaveAIPostMessageHandler(w http.ResponseWriter, r *http.Request) {
+	// Only allow POST method
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request body
+	var req PostMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Validate chatid is present and is a UUID
+	if req.ChatID == "" {
+		http.Error(w, "chatid is required in request body", http.StatusBadRequest)
+		return
+	}
+	if _, err := uuid.Parse(req.ChatID); err != nil {
+		http.Error(w, "chatid must be a valid UUID", http.StatusBadRequest)
+		return
+	}
+
+	// Get RTInfo from TabId or BuilderId
+	var rtInfo *waveobj.ObjRTInfo
+	if req.TabId != "" {
+		oref := waveobj.MakeORef(waveobj.OType_Tab, req.TabId)
+		rtInfo = wstore.GetRTInfo(oref)
+	} else if req.BuilderId != "" {
+		oref := waveobj.MakeORef(waveobj.OType_Builder, req.BuilderId)
+		rtInfo = wstore.GetRTInfo(oref)
+	}
+	if rtInfo == nil {
+		rtInfo = &waveobj.ObjRTInfo{}
+	}
+
+	// Get WaveAI settings
+	premium := shouldUsePremium()
+	builderMode := req.BuilderId != ""
+	if req.AIMode == "" {
+		http.Error(w, "aimode is required in request body", http.StatusBadRequest)
+		return
+	}
+	aiOpts, err := getWaveAISettings(premium, builderMode, *rtInfo, req.AIMode)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("WaveAI configuration error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Call the core WaveAIPostMessage function
+	chatOpts := uctypes.WaveChatOpts{
+		ChatId:               req.ChatID,
+		ClientId:             wstore.GetClientId(),
+		Config:               *aiOpts,
+		TabId:                req.TabId,
+		WidgetAccess:         req.WidgetAccess,
+		MCPAccess:            req.MCPAccess,
+		AllowNativeWebSearch: aiOpts.Provider == uctypes.AIProvider_Wave || strings.Contains(aiOpts.Endpoint, "anthropic.com"),
+		BuilderId:            req.BuilderId,
+		BuilderAppId:         req.BuilderAppId,
+		OwnedWidgets:         uctypes.NewOwnedWidgetSet(),
+	}
+	chatOpts.SystemPrompt = getSystemPrompt(chatOpts.Config.APIType, chatOpts.Config.Model, chatOpts.BuilderId != "", chatOpts.Config.HasCapability(uctypes.AICapabilityTools), chatOpts.WidgetAccess, chatOpts.MCPAccess)
+
+	// Register chat-tab mapping for session history persistence
+	if req.TabId != "" {
+		sessionhistory.RegisterChatTab(req.ChatID, req.TabId)
+	}
+
+	// Inject project context
+	if req.TabId != "" {
+		cwd := getTerminalCwd(r.Context(), req.TabId)
+		if cwd != "" {
+			// Auto-approve reads under the tab's working directory for this session.
+			// Sensitive paths (.ssh, .aws, etc.) are still blocked by sessionapproval.go.
+			AddSessionReadApproval(cwd)
+			// Explicit CWD in system prompt so model knows absolute paths
+			chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, fmt.Sprintf("<working_directory>%s</working_directory>", cwd))
+			// Project stack info (name, tech stack, architecture) - always injected (~50 tokens)
+			if stack := projectctx.ExtractProjectStack(cwd); stack != "" {
+				chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, stack)
+			}
+			// Critical rules from CLAUDE.md/WAVE.md - always injected (~100 tokens)
+			if rules := projectctx.ExtractCriticalRules(cwd); rules != "" {
+				chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, rules)
+			}
+			// Git context (branch, modified files, recent commits) - always injected (~200 tokens)
+			if gitCtx := projectctx.ExtractGitContext(cwd); gitCtx != "" {
+				chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, gitCtx)
+			}
+			// First message only: full project instructions + repo map + hints
+			if chatstore.DefaultChatStore.CountUserMessages(req.ChatID) == 0 {
+				// Inject full project instructions from all instruction files
+				instrFiles := projectctx.FindAllInstructionsFiles(cwd)
+				for _, filePath := range instrFiles {
+					pi, err := projectctx.ParseInstructions(filePath)
+					if err != nil || pi == nil {
+						continue
+					}
+					fullCtx := projectctx.GetFullContext(pi)
+					if fullCtx != "" {
+						chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, fullCtx)
+					}
+				}
+				// Repo map with timeout (tree-sitter parsing can be slow on large projects)
+				log.Printf("[repomap] analyzing project structure for %s...\n", cwd)
+				repoMapStart := time.Now()
+				repoMapDone := make(chan string, 1)
+				go func() {
+					repoMapDone <- repomap.BuildRepoMap(cwd, 6000)
+				}()
+				select {
+				case repoMapStr := <-repoMapDone:
+					log.Printf("[repomap] done in %.1fs for %s\n", time.Since(repoMapStart).Seconds(), cwd)
+					if repoMapStr != "" {
+						chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, repoMapStr)
+					}
+				case <-time.After(15 * time.Second):
+					log.Printf("[repomap] timed out after 15s for %s, falling back to tree\n", cwd)
+					if tree := projectctx.GetProjectTree(cwd, 2); tree != "" {
+						chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, tree)
+					}
+				}
+				// Hints about available context (compact)
+				var hints []string
+				if len(instrFiles) > 0 {
+					hints = append(hints, "full project instructions loaded above — use wave_utils(action='project_instructions') only to re-read specific sections")
+				}
+				if sessionhistory.LoadSessionHistory(req.TabId) != "" {
+					hints = append(hints, "previous session history available via wave_utils(action='session_history')")
+				}
+				if len(hints) > 0 {
+					chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, "Context: "+strings.Join(hints, "; ")+".")
+				}
+			}
+
+			// Check if message is a direct skill invocation (/skill-name args)
+			// When user types /skill-name, inject the skill body directly into system prompt
+			// (the invoke_skill tool handles AI-initiated skill invocations)
+			if skillName, rawArgs, ok := skills.ParseSlashCommand(req.Msg.GetText()); ok {
+				if loaded, err := skills.LoadSkillContent(cwd, skillName); err == nil {
+					chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, skills.FormatSkillInvocation(loaded, rawArgs))
+				} else {
+					log.Printf("[skills] skill %q not found: %v\n", skillName, err)
+				}
+			}
+		}
+	}
+
+	// Inject active plan status if one exists for this tab
+	if req.TabId != "" {
+		activePlan := aiplan.GetPlan(req.TabId)
+		if activePlan != nil && !aiplan.IsComplete(activePlan) {
+			chatOpts.SystemPrompt = append(chatOpts.SystemPrompt, aiplan.FormatPlanStatus(activePlan))
+		}
+	}
+
+	if req.TabId != "" {
+		chatOpts.TabStateGenerator = func() (string, []uctypes.ToolDefinition, string, error) {
+			tabState, tabTools, err := GenerateTabStateAndTools(r.Context(), req.TabId, req.WidgetAccess, &chatOpts)
+			return tabState, tabTools, req.TabId, err
+		}
+		// Extract CWD for MCP context: prefer explicit mcpcwd, fallback to terminal CWD
+		if req.MCPAccess {
+			if req.MCPCwd != "" {
+				chatOpts.MCPCwd = req.MCPCwd
+			} else {
+				chatOpts.MCPCwd = getTerminalCwd(r.Context(), req.TabId)
+			}
+		}
+	}
+
+	if req.BuilderAppId != "" {
+		chatOpts.BuilderAppGenerator = func() (string, string, string, error) {
+			return generateBuilderAppData(req.BuilderAppId)
+		}
+	}
+
+	if req.BuilderAppId != "" {
+		chatOpts.Tools = append(chatOpts.Tools,
+			GetBuilderWriteAppFileToolDefinition(req.BuilderAppId, req.BuilderId),
+			GetBuilderEditAppFileToolDefinition(req.BuilderAppId, req.BuilderId),
+			GetBuilderListFilesToolDefinition(req.BuilderAppId),
+		)
+	}
+
+	// Sub-task tool: available when widget access is enabled and depth limit not reached
+	if chatOpts.WidgetAccess && chatOpts.SubTaskDepth < subTaskMaxDepth {
+		chatOpts.Tools = append(chatOpts.Tools, GetRunSubTaskToolDefinition(&chatOpts))
+	}
+
+	// Validate the message
+	if err := req.Msg.Validate(); err != nil {
+		http.Error(w, fmt.Sprintf("Message validation failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Create SSE handler and set up streaming
+	sseHandler := sse.MakeSSEHandlerCh(w, r.Context())
+	defer sseHandler.Close()
+
+	if err := WaveAIPostMessageWrap(r.Context(), sseHandler, &req.Msg, chatOpts); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to post message: %v", err), http.StatusInternalServerError)
+		return
+	}
+}
+
+func WaveAIGetChatHandler(w http.ResponseWriter, r *http.Request) {
+	// Only allow GET method
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get chatid from URL parameters
+	chatID := r.URL.Query().Get("chatid")
+	if chatID == "" {
+		http.Error(w, "chatid parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	// Validate chatid is a UUID
+	if _, err := uuid.Parse(chatID); err != nil {
+		http.Error(w, "chatid must be a valid UUID", http.StatusBadRequest)
+		return
+	}
+
+	// Get chat from store
+	chat := chatstore.DefaultChatStore.Get(chatID)
+	if chat == nil {
+		http.Error(w, "chat not found", http.StatusNotFound)
+		return
+	}
+
+	// Set response headers for JSON
+	w.Header().Set("Content-Type", "application/json")
+
+	// Encode and return the chat
+	if err := json.NewEncoder(w).Encode(chat); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
+		return
+	}
+}
+
+// WaveAIGetSkillsHandler returns available skills for the given tab's CWD.
+func WaveAIGetSkillsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tabId := r.URL.Query().Get("tabid")
+	if tabId == "" {
+		http.Error(w, "tabid parameter is required", http.StatusBadRequest)
+		return
+	}
+	cwd := getTerminalCwd(r.Context(), tabId)
+	manifests := skills.DiscoverSkills(cwd)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(manifests)
+}
+
+// CreateWriteTextFileDiff generates a diff for write_text_file or edit_text_file tool calls.
+// Returns the original content, modified content, and any error.
+// For Anthropic, this returns an unimplemented error.
+func CreateWriteTextFileDiff(ctx context.Context, chatId string, toolCallId string) ([]byte, []byte, error) {
+	aiChat := chatstore.DefaultChatStore.Get(chatId)
+	if aiChat == nil {
+		return nil, nil, fmt.Errorf("chat not found: %s", chatId)
+	}
+
+	backend, err := GetBackendByAPIType(aiChat.APIType)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	funcCallInput := backend.GetFunctionCallInputByToolCallId(*aiChat, toolCallId)
+	if funcCallInput == nil {
+		return nil, nil, fmt.Errorf("tool call not found: %s", toolCallId)
+	}
+
+	toolName := funcCallInput.Name
+	if toolName != "write_text_file" && toolName != "edit_text_file" {
+		return nil, nil, fmt.Errorf("tool call %s is not a write_text_file or edit_text_file (got: %s)", toolCallId, toolName)
+	}
+
+	var backupFileName string
+	if funcCallInput.ToolUseData != nil {
+		backupFileName = funcCallInput.ToolUseData.WriteBackupFileName
+	}
+
+	var parsedArguments any
+	if err := json.Unmarshal([]byte(funcCallInput.Arguments), &parsedArguments); err != nil {
+		return nil, nil, fmt.Errorf("failed to unmarshal arguments: %w", err)
+	}
+
+	if toolName == "edit_text_file" {
+		originalContent, modifiedContent, err := EditTextFileDryRun(parsedArguments, backupFileName)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to generate diff: %w", err)
+		}
+		return originalContent, modifiedContent, nil
+	}
+
+	params, err := parseWriteTextFileInput(parsedArguments)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse write_text_file input: %w", err)
+	}
+
+	var originalContent []byte
+	if backupFileName != "" {
+		originalContent, err = os.ReadFile(backupFileName)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read backup file: %w", err)
+		}
+	} else {
+		expandedPath, err := wavebase.ExpandHomeDir(params.Filename)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to expand path: %w", err)
+		}
+		originalContent, err = os.ReadFile(expandedPath)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, nil, fmt.Errorf("failed to read original file: %w", err)
+		}
+	}
+
+	modifiedContent := []byte(params.Contents)
+	return originalContent, modifiedContent, nil
+}
+
+type StaticFileInfo struct {
+	Name         string `json:"name"`
+	Size         int64  `json:"size"`
+	Modified     string `json:"modified"`
+	ModifiedTime string `json:"modified_time"`
+}
+
+func generateBuilderAppData(appId string) (string, string, string, error) {
+	appGoFile := ""
+	fileData, err := waveappstore.ReadAppFile(appId, "app.go")
+	if err == nil {
+		appGoFile = string(fileData.Contents)
+	}
+
+	staticFilesJSON := ""
+	allFiles, err := waveappstore.ListAllAppFiles(appId)
+	if err == nil {
+		var staticFiles []StaticFileInfo
+		for _, entry := range allFiles.Entries {
+			if strings.HasPrefix(entry.Name, "static/") {
+				staticFiles = append(staticFiles, StaticFileInfo{
+					Name:         entry.Name,
+					Size:         entry.Size,
+					Modified:     entry.Modified,
+					ModifiedTime: entry.ModifiedTime,
+				})
+			}
+		}
+
+		if len(staticFiles) > 0 {
+			staticFilesBytes, marshalErr := json.Marshal(staticFiles)
+			if marshalErr == nil {
+				staticFilesJSON = string(staticFilesBytes)
+			}
+		}
+	}
+
+	platformInfo := wavebase.GetSystemSummary()
+	if currentUser, userErr := user.Current(); userErr == nil && currentUser.Username != "" {
+		platformInfo = fmt.Sprintf("Local Machine: %s, User: %s", platformInfo, currentUser.Username)
+	} else {
+		platformInfo = fmt.Sprintf("Local Machine: %s", platformInfo)
+	}
+
+	return appGoFile, staticFilesJSON, platformInfo, nil
+}
+
+// saveAllSessionHistories converts all in-memory chats to UIChat and saves as session history.
+// onChatIdChange is called when waveai:chatid changes (e.g. user starts a new chat).
+// It saves the old chat's session history so it's available in the next chat.
+func onChatIdChange(oref waveobj.ORef, oldChatId string) {
+	tabId := sessionhistory.GetTabForChat(oldChatId)
+	if tabId == "" {
+		// Try to derive tabId from oref (oref is typically tab:tabid)
+		if oref.OType == "tab" {
+			tabId = oref.OID
+		}
+	}
+	if tabId == "" {
+		return
+	}
+	aiChat := chatstore.DefaultChatStore.Get(oldChatId)
+	if aiChat == nil {
+		return
+	}
+	uiChat, err := ConvertAIChatToUIChat(aiChat)
+	if err != nil {
+		log.Printf("[sessionhistory] error converting chat %s on clear: %v\n", oldChatId[:8], err)
+		return
+	}
+	sessionhistory.SaveChatAsHistory(tabId, uiChat)
+	chatstore.DefaultChatStore.Delete(oldChatId)
+	log.Printf("[sessionhistory] saved history for chat %s (new chat started)\n", oldChatId[:8])
+}
+
+func saveAllSessionHistories() {
+	allChats := chatstore.DefaultChatStore.GetAll()
+	mappings := sessionhistory.GetAllMappings()
+	saved := 0
+	for chatId, aiChat := range allChats {
+		tabId, ok := mappings[chatId]
+		if !ok || tabId == "" {
+			continue
+		}
+		uiChat, err := ConvertAIChatToUIChat(aiChat)
+		if err != nil {
+			log.Printf("[sessionhistory] error converting chat %s: %v\n", chatId[:8], err)
+			continue
+		}
+		sessionhistory.SaveChatAsHistory(tabId, uiChat)
+		saved++
+	}
+	if saved > 0 {
+		log.Printf("[sessionhistory] saved %d session histories at shutdown\n", saved)
+	}
+}
